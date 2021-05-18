@@ -24,7 +24,7 @@ The arguments in __init__ get be requested and dynamically added to an argument 
 def _isScoringFunction(obj):
     """Return True is object is a valid scoring function"""
     if inspect.isclass(obj):
-        if callable(obj):
+        if callable(obj) and obj.__name__[0] != '_':
             sig = inspect.getfullargspec(obj.__call__)
             if len(sig.args) == 2:
                 if "return" in sig.annotations and 'smiles' in sig.annotations:

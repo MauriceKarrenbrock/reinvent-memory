@@ -10,9 +10,34 @@ import openeye.oeomega as oeomega
 import utils
 
 
-class docking_base(object):
+class _Docking(object):
+    """Docking superclass
+    
+    Methods
+    --------
+    make_docking(smile)
+        takes a string (SMILE) and will return a docking score
+        must be implemented by the sub-classes
+    __call__(smiles)
+        given a list of smiles strings will return a numpy array of scores
+    """
+
     def __init__(self, receptor: utils.FilePath):
         self.receptor_file = receptor
+
+    def __call__(self, smiles: List[str]) -> dict:
+        score = np.full(len(smiles), 0, dtype=np.float32)
+        for idx, smi in enumerate(smiles):
+            score[idx] = self.make_docking(smi)
+        return {"total_score": np.array(score, dtype=np.float32)}
+
+    def make_docking(self, smile):
+        pass
+
+class DockingOedocking(_Docking):
+    """Scores based on the omega docking."""
+    def __init__(self, receptor: utils.FilePath):
+        super().__init__(receptor)
         omegaOpts = oeomega.OEOmegaOptions()
         omegaOpts.SetStrictStereo(False)
         self.omega = oeomega.OEOmega(omegaOpts)
@@ -22,7 +47,7 @@ class docking_base(object):
         self.dock = oedocking.OEDock()
         self.dock.Initialize(oereceptor)
 
-    def __call__(self, smile):
+    def make_docking(self, smile):
         mol = oechem.OEMol()
         if not oechem.OESmilesToMol(mol, smile):
             return 0.0
@@ -37,13 +62,16 @@ class docking_base(object):
         """
         :return: A tuple with the constructor and its arguments. Used to reinitialize the object for pickling
         """
-        return docking_base, (self.receptor_file,)
+        return DockingOedocking, (self.receptor_file,)
 
 
-class docking(docking_base):
-    """Scores based on the omega docking."""
-    def __call__(self, smiles: List[str]) -> dict:
-        score = np.full(len(smiles), 0, dtype=np.float32)
-        for idx, smi in enumerate(smiles):
-            score[idx] = super()(smi)
-        return {"total_score": np.array(score, dtype=np.float32)}
+class DockingPyscreen(_Docking):
+
+    def make_docking(self, smile):
+        raise NotImplementedError('Work in progress')
+
+    def __reduce__(self):
+        """
+        :return: A tuple with the constructor and its arguments. Used to reinitialize the object for pickling
+        """
+        return DockingPyscreen, (self.receptor_file,)
