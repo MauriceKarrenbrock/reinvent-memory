@@ -4,13 +4,14 @@ from typing import List
 from pathlib import Path
 import math
 import os
+import shutil
+import subprocess
+from itertools import takewhile
 
 import numpy as np
 import openeye.oechem as oechem
 import openeye.oedocking as oedocking
 import openeye.oeomega as oeomega
-import pyscreener.preprocessing.tautomers as _tautomers
-import pyscreener.docking.vina as _vina
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
@@ -73,31 +74,78 @@ class DockingOedocking(_Docking):
         return DockingOedocking, (self.receptor_file,)
 
 
-class _DockingVinaPyscreenerSuperclass(_Docking):
-    """The superclass to dock with Vina like software using pyscreener
+class DockingQvina(_Docking):
+    """Docking with qvina
+
+    Extra parameters
+
+    --receptor
+        the path to the receptor file(s) comma separated list if more than one
+    --box_center=(8.882, 6.272, -9.486)
+        the center of the docking box
+    --box_size=(10,10,10)
+        the x y z radii of the box in Angstrom comma separated values (default 10,10,10)
+    --qvina_path
+        path to the qvina executable, default will search in PATH
+    --all_smiles_csv
+        a csv file where all the smiles and docking scores are saved default='all_smiles.csv'
+    --ADFRsuite_bin
+        the path to the adrfsuite bin default ~/ADFRsuite-1.0/bin
+    --output_path
+        where to save all the temporary docking files default ./docking_stuff
+    --num_cpu
+        the number of cpu that qvina shall use, default os.cpu_count()
+    --max_conformers
+        default 4
     """
-    def __init__(self, receptor, box_center=(8.882, 6.272, -9.486), box_size=(10,10,10), output_path='./docking_stuff', docking_program='qvina',
-    all_smiles_csv='all_smiles.csv'):
+    def __init__(self,
+    receptor,
+    box_center=(8.882, 6.272, -9.486),
+    box_size=(10,10,10),
+    output_path='./docking_stuff',
+    qvina_path=None,
+    all_smiles_csv='all_smiles.csv',
+    ADFRsuite_bin='~/ADFRsuite-1.0/bin',
+    num_cpu=os.cpu_count(),
+    max_conformers=4):
+
         super().__init__(receptor)
-        #vina class wants a list of strings
-        if isinstance(self.receptor_file, str) or (
-            not hasattr(self.receptor_file, '__iter__')):
+
+        # I want to have a list of Path
+        if isinstance(self.receptor_file, str):
+            self.receptor_file = self.receptor_file.split(',')
+        elif not hasattr(self.receptor_file, '__iter__'):
             self.receptor_file = [self.receptor_file]
+
         for i, j in enumerate(self.receptor_file):
-            self.receptor_file[i] = str(j)
+            self.receptor_file[i] = Path(j).resolve()
         
+        if isinstance(box_center, str):
+            box_center = box_center.split(',')
+        if len(box_center) != 3:
+            raise ValueError('Box center needs the x y z values')
         self.box_center = box_center
+
+        if isinstance(box_size, str):
+            box_size = box_size.split(',')
+        if len(box_size) != 3:
+            raise ValueError('Box size needs the x y z values')
         self.box_size = box_size
+
         self.output_path = Path(output_path)
         self.output_path.mkdir(exist_ok=True, parents=True)
 
-        # subclass dependent
-        # but in this way you can use this superclass
-        # as a jack of all trades class
-        self.docking_program = docking_program
+        if qvina_path is None:
+            qvina_path = shutil.which('qvina')
+            if qvina_path is None:
+                raise RuntimeError('qvina is not in $PATH')
+        self.qvina_path = Path(qvina_path).resolve()
 
-        self.vina = _vina.Vina(self.docking_program, center=self.box_center, size=self.box_size,
-        path=str(self.output_path.resolve()), receptors=self.receptor_file)
+        self.ADFRsuite_bin = Path(ADFRsuite_bin).resolve()
+
+        self.num_cpu = num_cpu
+
+        self.max_conformers = max_conformers
 
         # A CSV file where I will save all the smiles
         # and the docking scores
@@ -105,21 +153,26 @@ class _DockingVinaPyscreenerSuperclass(_Docking):
         with self.all_smiles_csv.open('w') as f:
             f.write('SMILES,DockingScore\n')
 
-    def get_conformers(self, smi, max_conformers=4):
+
+        self.qvina_log_file = self.output_path / 'tmp_qvina_log.log'
+
+        # Prepare the receptor(s) for docking
+        self.prepare_receptors()
+
+    def get_conformers(self, smi):
         
         mol = Chem.MolFromSmiles(smi)
         Chem.SanitizeMol(mol)
         mol = Chem.AddHs(mol)
         mol.SetProp("_Name",'Ligand')
 
-        cids = AllChem.EmbedMultipleConfs(mol, max_conformers, AllChem.ETKDG())
-        output_pdb = self.output_path / f'{smi}.pdb'
-        with output_pdb.open('w') as f:
-            #pdbwriter = Chem.PDBWriter(f)
-            for conf in cids: 
-                AllChem.UFFOptimizeMolecule(mol,confId=conf)
-                #pdbwriter.write(mol, conf)
-            f.write(Chem.MolToPDBBlock(mol))
+        cids = AllChem.EmbedMultipleConfs(mol, self.max_conformers, AllChem.ETKDG())
+        output_pdb = []
+        for i, conf in enumerate(cids):
+            output_pdb.append(self.output_path / f'{smi}_conformer{i}.pdb')
+            pdbwriter = Chem.PDBWriter(str(output_pdb[-1]))
+            AllChem.UFFOptimizeMolecule(mol,confId=conf)
+            pdbwriter.write(mol, conf)
 
         return output_pdb
 
@@ -134,48 +187,202 @@ class _DockingVinaPyscreenerSuperclass(_Docking):
         """
         return 1/(1+math.exp(a*score + b))
 
+    def prepare_receptors(self):
+        for i, receptor in enumerate(self.receptor_file):
+            commands = [str(self.ADFRsuite_bin / 'prepare_receptor'),
+            '-r', str(receptor),
+            '-o', str(receptor.with_suffix('.pdbqt')),
+            '-A', 'bonds_hydrogens']
+
+            # As a default will try to repair enything possible
+            # if it fails won't repair anything
+            try:
+                self.use_subprocess(commands,
+                shell=False,
+                error_string='error during receptor preparation')
+            except RuntimeError:
+                commands.pop(-1)
+                commands.pop(-1)
+
+                self.use_subprocess(commands,
+                shell=False,
+                error_string='error during receptor preparation')
+            
+            self.receptor_file[i] = receptor.with_suffix('.pdbqt')
+
+    def prepare_ligands_from_files(self, files):
+
+        output_pdbqt = []
+
+        for ligand in files:
+            commands = [str(self.ADFRsuite_bin / 'prepare_ligand'),
+            '-l', str(ligand),
+            '-o', str(ligand.with_suffix('.pdbqt')),
+            '-A', 'bonds_hydrogens']
+
+            # As a default will try to repair enything possible
+            # if it fails won't repair anything
+            try:
+                self.use_subprocess(commands,
+                shell=False,
+                error_string=f'error during ligand preparation\n{ligand}')
+            except RuntimeError:
+                commands.pop(-1)
+                commands.pop(-1)
+
+                self.use_subprocess(commands,
+                shell=False,
+                error_string=f'error during ligand preparation\n{ligand}')
+            
+            output_pdbqt.append(ligand.with_suffix('.pdbqt'))
+
+        return output_pdbqt
+
+    def parse_qvina_log_file(self, score_mode='best'):
+        """Parse the log file generated from a run of Vina-type docking software
+        and return the appropriate score.
+        Parameters
+        ----------
+        score_mode : str (Default = 'best')
+            The method used to calculate the docking score from the log file.
+            See also pyscreener.utils.calc_score for more details
+        Returns
+        -------
+        score : Optional[float]
+            the parsed score given the input scoring mode or None if the log
+            file was unparsable 
+        """
+        # This code comes from pyscreener and is under the 
+        # MIT license https://github.com/coleygroup/pyscreener
+
+
+        # HELPER FUNCTION
+        #-------------------------------------------------------------
+        def calc_score(scores, score_mode='best'):
+            """Calculate an overall score from a sequence of scores
+            Parameters
+            ----------
+            scores : Sequence[float]
+            score_mode : str, default='best'
+                the method used to calculate the overall score. Choices include:
+                * 'best': return the top score
+                * 'avg': return the average of the scores
+                * 'boltzmann': return the boltzmann average of the scores
+            Returns
+            -------
+            score : float
+            """
+            scores = sorted(scores)
+            if score_mode in ('best', 'top'):
+                score = scores[0]
+            elif score_mode in ('avg', 'mean'):
+                score = sum(score for score in scores) / len(scores)
+            elif score_mode == 'boltzmann':
+                Z = sum(exp(-score) for score in scores)
+                score = sum(score * exp(-score) / Z for score in scores)
+            else:
+                score = scores[0]
+                
+            return score
+        #-----------------------------------------------------------------------
+
+        # vina-type log files have scoring information between this table border
+        # and the line containing "Writing output ... done."
+        TABLE_BORDER = '-----+------------+----------+----------'
+
+        with self.qvina_log_file.open('r') as fid:
+            for line in fid:
+                if TABLE_BORDER in line:
+                    break
+
+            score_lines = takewhile(lambda line: 'Writing' not in line, fid)
+            scores = [float(line.split()[1]) for line in score_lines]
+
+        if len(scores) == 0:
+            return None
+
+        return calc_score(scores, score_mode)
+
+
+    def execute_qvina(self, ligand):
+
+        scores = []
+        for receptor in self.receptor_file:
+            commands = [
+            str(self.qvina_path),
+            f'--receptor={receptor}',
+            f'--ligand={ligand}',
+            f'--center_x={self.box_center[0]}',
+            f'--center_y={self.box_center[1]}',
+            f'--center_z={self.box_center[2]}',
+            f'--size_x={self.box_size[0]}',
+            f'--size_y={self.box_size[1]}',
+            f'--size_z={self.box_size[2]}',
+            f'--cpu={self.num_cpu}',
+            f'--out={self.output_path / "tmp_docked.pdbqt"}',
+            f'--log={self.qvina_log_file}'
+            ]
+
+            try:
+                self.use_subprocess(commands,
+                    shell=False,
+                    error_string='docking was not succesful')
+            
+            except RuntimeError:
+                print(f'\n\nDocking of {ligand} on {receptor} was not succesful\n\n')
+
+                scores.append(None)
+            
+            else:
+                scores.append(self.parse_qvina_log_file())
+
+        return scores
+
     def make_docking(self, smi):
         #check if it is a valid SMILES
         if Chem.MolFromSmiles(smi) is None:
             return 0.0
 
         conformers = self.get_conformers(smi)
-        conformers = self.vina.prepare_from_file(conformers)
+        conformers = self.prepare_ligands_from_files(conformers)
         best_value = float('inf')
 
         for conformer in conformers:
-            docking_output = self.vina.dock_ligand(conformer, software=self.docking_program,
-                        receptors=self.receptor_file,
-                        center=self.box_center,
-                        size=self.box_size, ncpu=OMP_NUM_THREADS, 
-                        path=str(self.output_path))
+            docking_output = self.execute_qvina(conformer)
 
             for receptor in docking_output:
-                for docking_run in receptor:
-                    if docking_run['score'] is not None:
-                        best_value = min(best_value, docking_run['score'])
+                if receptor is not None:
+                    best_value = min(best_value, receptor)
+
+            #remove file (would fill too much space)
+            conformer.unlink()
 
         if best_value == float('inf'): #all docking failed
             with self.all_smiles_csv.open('a') as f:
                 f.write(f'{smi},nan\n')
-            return 10 #the score resulting from the sigmoid will be 0 (no risk of overflow)
-
-        with self.all_smiles_csv.open('a') as f:
-            f.write(f'{smi},{best_value:.18e}\n')
+        
+        else:
+            with self.all_smiles_csv.open('a') as f:
+                f.write(f'{smi},{best_value:.18e}\n')
 
         return self.score_transformation(best_value)
+
+    @staticmethod
+    def use_subprocess(commands, shell=False, error_string='error during the call of an external program'):
+
+        r = subprocess.run(commands,
+                        shell=shell,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False)
+
+        if r.returncode != 0:
+            print(r.stdout)
+            print(r.stderr)
+            raise RuntimeError(error_string)
 
     def __reduce__(self):
         """
         :return: A tuple with the constructor and its arguments. Used to reinitialize the object for pickling
         """
-        return _DockingVinaPyscreenerSuperclass, (self.receptor_file,)
-
-class DockingQvina(_DockingVinaPyscreenerSuperclass):
-    def __init__(self, receptor, box_center=(8.882, 6.272, -9.486), box_size=(10,10,10), output_path='./docking_stuff', docking_program
-            ='qvina',
-                all_smiles_csv='all_smiles.csv'):
-        super().__init__(receptor, box_center=(8.882, 6.272, -9.486), box_size=(10,10,10), output_path='./docking_stuff', docking_program
-                ='qvina',
-                    all_smiles_csv='all_smiles.csv')
-        self.docking_program = 'qvina'
+        return DockingQvina, (self.receptor_file,)

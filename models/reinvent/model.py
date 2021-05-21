@@ -230,13 +230,9 @@ class Model:
             entropy += -torch.sum((log_prob * prob), 1)
 
             x = Variable(x.data)
-            #EOS_sampled = (x == self.voc.vocab['$'])
             unfinished.masked_fill_(x == self.voc.vocab['$'], 0)
-            #unfinished = torch.eq(unfinished - EOS_sampled, 1)
             if torch.sum(unfinished) == 0:
                 break
-            #if torch.allclose(torch.eq(EOS_sampled, True), True):
-            #    break
 
         sequences = torch.cat(sequences, 1)
         return sequences.data, log_probs, entropy
