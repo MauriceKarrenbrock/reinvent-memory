@@ -35,9 +35,12 @@ class _Docking(object):
         self.receptor_file = receptor
 
     def __call__(self, smiles: List[str]) -> dict:
-        score = np.full(len(smiles), 0, dtype=np.float32)
+        score = np.empty(len(smiles), dtype=np.float32)
         for idx, smi in enumerate(smiles):
-            score[idx] = self.make_docking(smi)
+            try:
+                score[idx] = self.make_docking(smi)
+            except Exception:
+                score[idx] = 0
         return {"total_score": np.array(score, dtype=np.float32)}
 
     def make_docking(self, smile):
@@ -100,8 +103,8 @@ class DockingQvina(_Docking):
     """
     def __init__(self,
     receptor,
-    box_center=(8.882, 6.272, -9.486),
-    box_size=(10,10,10),
+    box_center=[8.882, 6.272, -9.486],
+    box_size=[10,10,10],
     output_path='./docking_stuff',
     qvina_path=None,
     all_smiles_csv='all_smiles.csv',
@@ -118,16 +121,20 @@ class DockingQvina(_Docking):
             self.receptor_file = [self.receptor_file]
 
         for i, j in enumerate(self.receptor_file):
-            self.receptor_file[i] = Path(j).resolve()
+            self.receptor_file[i] = Path(j).expanduser().resolve()
         
         if isinstance(box_center, str):
             box_center = box_center.split(',')
+            for i in range(len((box_center))):
+                box_center[i] = float(box_center[i])
         if len(box_center) != 3:
             raise ValueError('Box center needs the x y z values')
         self.box_center = box_center
 
         if isinstance(box_size, str):
             box_size = box_size.split(',')
+            for i in range(len((box_size))):
+                box_size[i]=float(box_size[i])
         if len(box_size) != 3:
             raise ValueError('Box size needs the x y z values')
         self.box_size = box_size
@@ -139,13 +146,13 @@ class DockingQvina(_Docking):
             qvina_path = shutil.which('qvina')
             if qvina_path is None:
                 raise RuntimeError('qvina is not in $PATH')
-        self.qvina_path = Path(qvina_path).resolve()
+        self.qvina_path = Path(qvina_path).expanduser().resolve()
 
-        self.ADFRsuite_bin = Path(ADFRsuite_bin).resolve()
+        self.ADFRsuite_bin = Path(ADFRsuite_bin).expanduser().resolve()
 
-        self.num_cpu = num_cpu
+        self.num_cpu = int(num_cpu)
 
-        self.max_conformers = max_conformers
+        self.max_conformers = int(max_conformers)
 
         # A CSV file where I will save all the smiles
         # and the docking scores
@@ -169,14 +176,18 @@ class DockingQvina(_Docking):
         cids = AllChem.EmbedMultipleConfs(mol, self.max_conformers, AllChem.ETKDG())
         output_pdb = []
         for i, conf in enumerate(cids):
-            output_pdb.append(self.output_path / f'{smi}_conformer{i}.pdb')
+            output_pdb.append(self.output_path / f'conformer{i}.pdb')
             pdbwriter = Chem.PDBWriter(str(output_pdb[-1]))
-            AllChem.UFFOptimizeMolecule(mol,confId=conf)
+            try:
+                AllChem.UFFOptimizeMolecule(mol,confId=conf)
+            except Exception:
+                pass
             pdbwriter.write(mol, conf)
 
         return output_pdb
 
-    def score_transformation(score, a=0.54931, b=2.19722):
+    @staticmethod
+    def score_transformation(score, a=0.3427775704, b=2.944438979):#a=0.54931, b=2.19722):
         """Inverted sigmoid
 
         it gets to 1 for X going to -inf and to 0 for
@@ -190,23 +201,25 @@ class DockingQvina(_Docking):
     def prepare_receptors(self):
         for i, receptor in enumerate(self.receptor_file):
             commands = [str(self.ADFRsuite_bin / 'prepare_receptor'),
-            '-r', str(receptor),
-            '-o', str(receptor.with_suffix('.pdbqt')),
+            '-r', str(receptor.name),
+            '-o', str(receptor.with_suffix('.pdbqt').name),
             '-A', 'bonds_hydrogens']
 
             # As a default will try to repair enything possible
             # if it fails won't repair anything
             try:
                 self.use_subprocess(commands,
-                shell=False,
-                error_string='error during receptor preparation')
+                    cwd=str(receptor.parent),
+                    shell=False,
+                    error_string='error during receptor preparation')
             except RuntimeError:
                 commands.pop(-1)
                 commands.pop(-1)
 
                 self.use_subprocess(commands,
-                shell=False,
-                error_string='error during receptor preparation')
+                    cwd=str(receptor.parent),
+                    shell=False,
+                    error_string='error during receptor preparation')
             
             self.receptor_file[i] = receptor.with_suffix('.pdbqt')
 
@@ -215,24 +228,27 @@ class DockingQvina(_Docking):
         output_pdbqt = []
 
         for ligand in files:
+            ligand = ligand.expanduser().resolve()
             commands = [str(self.ADFRsuite_bin / 'prepare_ligand'),
-            '-l', str(ligand),
-            '-o', str(ligand.with_suffix('.pdbqt')),
+            '-l', str(ligand.name),
+            '-o', str(ligand.with_suffix('.pdbqt').name),
             '-A', 'bonds_hydrogens']
 
             # As a default will try to repair enything possible
             # if it fails won't repair anything
             try:
                 self.use_subprocess(commands,
+                    cwd=str(ligand.parent),
                 shell=False,
-                error_string=f'error during ligand preparation\n{ligand}')
+                error_string=f'error during ligand preparation\n{str(ligand)}')
             except RuntimeError:
                 commands.pop(-1)
                 commands.pop(-1)
 
                 self.use_subprocess(commands,
-                shell=False,
-                error_string=f'error during ligand preparation\n{ligand}')
+                    cwd=str(ligand.parent),
+                    shell=False,
+                    error_string=f'error during ligand preparation\n{str(ligand)}')
             
             output_pdbqt.append(ligand.with_suffix('.pdbqt'))
 
@@ -354,8 +370,6 @@ class DockingQvina(_Docking):
                 if receptor is not None:
                     best_value = min(best_value, receptor)
 
-            #remove file (would fill too much space)
-            conformer.unlink()
 
         if best_value == float('inf'): #all docking failed
             with self.all_smiles_csv.open('a') as f:
@@ -368,13 +382,17 @@ class DockingQvina(_Docking):
         return self.score_transformation(best_value)
 
     @staticmethod
-    def use_subprocess(commands, shell=False, error_string='error during the call of an external program'):
+    def use_subprocess(commands, shell=False, error_string='error during the call of an external program', cwd=None):
+        
+        if cwd is None:
+            cwd = str(Path('.').resolve())
 
         r = subprocess.run(commands,
                         shell=shell,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
-                        check=False)
+                        check=False,
+                        cwd=cwd)
 
         if r.returncode != 0:
             print(r.stdout)
@@ -385,4 +403,12 @@ class DockingQvina(_Docking):
         """
         :return: A tuple with the constructor and its arguments. Used to reinitialize the object for pickling
         """
-        return DockingQvina, (self.receptor_file,)
+        return DockingQvina, (self.receptor_file,
+            self.box_center,
+            self.box_size,
+            self.output_path,
+            self.qvina_path,
+            self.all_smiles_csv,
+            self.ADFRsuite_bin,
+            self.num_cpu,
+            self.max_conformers)
