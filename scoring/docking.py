@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 from itertools import takewhile
+from multiprocessing import Pool
 
 import numpy as np
 import openeye.oechem as oechem
@@ -16,8 +17,6 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 import utils
-
-OMP_NUM_THREADS = int(os.environ.get('OMP_NUM_THREADS', 1))
 
 class _Docking(object):
     """Docking superclass
@@ -157,16 +156,54 @@ class DockingQvina(_Docking):
         # A CSV file where I will save all the smiles
         # and the docking scores
         self.all_smiles_csv = Path(all_smiles_csv)
-        with self.all_smiles_csv.open('w') as f:
-            f.write('SMILES,DockingScore\n')
-
-
-        self.qvina_log_file = self.output_path / 'tmp_qvina_log.log'
+        if not self.all_smiles_csv.exists():
+            with self.all_smiles_csv.open('w') as f:
+                f.write('SMILES,DockingScore\n')
 
         # Prepare the receptor(s) for docking
         self.prepare_receptors()
 
-    def get_conformers(self, smi):
+    def __call__(self, smiles: List[str]) -> dict:
+        """This parallelized method overwrites the one of the superclass
+        """
+
+        with Pool(self.num_cpu) as pool:
+
+            scores = pool.starmap(
+                self._call_helper, list(zip(smiles, range(len(smiles)))), chunksize=1)
+
+            #scores = scores.get()
+
+        with self.all_smiles_csv.open('a') as f:
+            for smi, score, n in zip(smiles, scores, range(len(scores))):
+                if score == float('inf'): #could not be docked but is a valid molecule
+                    f.write(f'{smi},nan\n')
+
+                elif score is None:
+                    # SMILES not valid, the resulting score will be 0
+                    scores[n] = float('inf') 
+
+                else:
+                    f.write(f'{smi},{score:.18e}\n')
+            
+            f.flush()
+            
+        scores = list(map(self.score_transformation, scores))
+        
+        scores = np.array(scores, dtype=np.float32)
+
+        return {"total_score": scores}
+
+    def _call_helper(self, smi, number):
+        try:
+            score = self.make_docking(smi, number)
+        except Exception:
+            score = float('inf')
+        
+        return score
+        
+
+    def get_conformers(self, smi, number):
         
         mol = Chem.MolFromSmiles(smi)
         Chem.SanitizeMol(mol)
@@ -176,7 +213,7 @@ class DockingQvina(_Docking):
         cids = AllChem.EmbedMultipleConfs(mol, self.max_conformers, AllChem.ETKDG())
         output_pdb = []
         for i, conf in enumerate(cids):
-            output_pdb.append(self.output_path / f'conformer{i}.pdb')
+            output_pdb.append(self.output_path / f'conformer{i}_process{number}.pdb')
             pdbwriter = Chem.PDBWriter(str(output_pdb[-1]))
             try:
                 AllChem.UFFOptimizeMolecule(mol,confId=conf)
@@ -200,26 +237,27 @@ class DockingQvina(_Docking):
 
     def prepare_receptors(self):
         for i, receptor in enumerate(self.receptor_file):
-            commands = [str(self.ADFRsuite_bin / 'prepare_receptor'),
-            '-r', str(receptor.name),
-            '-o', str(receptor.with_suffix('.pdbqt').name),
-            '-A', 'bonds_hydrogens']
+            if not receptor.with_suffix('.pdbqt').exists():
+                commands = [str(self.ADFRsuite_bin / 'prepare_receptor'),
+                '-r', str(receptor.name),
+                '-o', str(receptor.with_suffix('.pdbqt').name),
+                '-A', 'bonds_hydrogens']
 
-            # As a default will try to repair enything possible
-            # if it fails won't repair anything
-            try:
-                self.use_subprocess(commands,
-                    cwd=str(receptor.parent),
-                    shell=False,
-                    error_string='error during receptor preparation')
-            except RuntimeError:
-                commands.pop(-1)
-                commands.pop(-1)
+                # As a default will try to repair anything possible
+                # if it fails won't repair anything
+                try:
+                    self.use_subprocess(commands,
+                        cwd=str(receptor.parent),
+                        shell=False,
+                        error_string='error during receptor preparation')
+                except RuntimeError:
+                    commands.pop(-1)
+                    commands.pop(-1)
 
-                self.use_subprocess(commands,
-                    cwd=str(receptor.parent),
-                    shell=False,
-                    error_string='error during receptor preparation')
+                    self.use_subprocess(commands,
+                        cwd=str(receptor.parent),
+                        shell=False,
+                        error_string='error during receptor preparation')
             
             self.receptor_file[i] = receptor.with_suffix('.pdbqt')
 
@@ -234,7 +272,7 @@ class DockingQvina(_Docking):
             '-o', str(ligand.with_suffix('.pdbqt').name),
             '-A', 'bonds_hydrogens']
 
-            # As a default will try to repair enything possible
+            # As a default will try to repair anything possible
             # if it fails won't repair anything
             try:
                 self.use_subprocess(commands,
@@ -254,7 +292,7 @@ class DockingQvina(_Docking):
 
         return output_pdbqt
 
-    def parse_qvina_log_file(self, score_mode='best'):
+    def parse_qvina_log_file(self, file_name, score_mode='best'):
         """Parse the log file generated from a run of Vina-type docking software
         and return the appropriate score.
         Parameters
@@ -294,8 +332,8 @@ class DockingQvina(_Docking):
             elif score_mode in ('avg', 'mean'):
                 score = sum(score for score in scores) / len(scores)
             elif score_mode == 'boltzmann':
-                Z = sum(exp(-score) for score in scores)
-                score = sum(score * exp(-score) / Z for score in scores)
+                Z = sum(math.exp(-score) for score in scores)
+                score = sum(score * math.exp(-score) / Z for score in scores)
             else:
                 score = scores[0]
                 
@@ -306,7 +344,7 @@ class DockingQvina(_Docking):
         # and the line containing "Writing output ... done."
         TABLE_BORDER = '-----+------------+----------+----------'
 
-        with self.qvina_log_file.open('r') as fid:
+        with open(file_name, 'r') as fid:
             for line in fid:
                 if TABLE_BORDER in line:
                     break
@@ -320,10 +358,13 @@ class DockingQvina(_Docking):
         return calc_score(scores, score_mode)
 
 
-    def execute_qvina(self, ligand):
+    def execute_qvina(self, ligand, number):
 
         scores = []
         for receptor in self.receptor_file:
+
+            log_file = self.output_path / f'tmp_qvina_log_file_process_{number}.log'
+
             commands = [
             str(self.qvina_path),
             f'--receptor={receptor}',
@@ -334,9 +375,9 @@ class DockingQvina(_Docking):
             f'--size_x={self.box_size[0]}',
             f'--size_y={self.box_size[1]}',
             f'--size_z={self.box_size[2]}',
-            f'--cpu={self.num_cpu}',
-            f'--out={self.output_path / "tmp_docked.pdbqt"}',
-            f'--log={self.qvina_log_file}'
+            f'--cpu=1',   #{self.num_cpu}',
+            f'--out={self.output_path / f"tmp_docked_process_{number}.pdbqt"}',
+            f'--log={log_file}'
             ]
 
             try:
@@ -350,36 +391,27 @@ class DockingQvina(_Docking):
                 scores.append(None)
             
             else:
-                scores.append(self.parse_qvina_log_file())
+                scores.append(self.parse_qvina_log_file(log_file))
 
         return scores
 
-    def make_docking(self, smi):
+    def make_docking(self, smi, number):
         #check if it is a valid SMILES
         if Chem.MolFromSmiles(smi) is None:
-            return 0.0
+            return None
 
-        conformers = self.get_conformers(smi)
+        conformers = self.get_conformers(smi, number)
         conformers = self.prepare_ligands_from_files(conformers)
         best_value = float('inf')
 
         for conformer in conformers:
-            docking_output = self.execute_qvina(conformer)
+            docking_output = self.execute_qvina(conformer, number)
 
             for receptor in docking_output:
                 if receptor is not None:
                     best_value = min(best_value, receptor)
 
-
-        if best_value == float('inf'): #all docking failed
-            with self.all_smiles_csv.open('a') as f:
-                f.write(f'{smi},nan\n')
-        
-        else:
-            with self.all_smiles_csv.open('a') as f:
-                f.write(f'{smi},{best_value:.18e}\n')
-
-        return self.score_transformation(best_value)
+        return best_value
 
     @staticmethod
     def use_subprocess(commands, shell=False, error_string='error during the call of an external program', cwd=None):
